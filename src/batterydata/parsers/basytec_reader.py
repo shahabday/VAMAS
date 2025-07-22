@@ -10,9 +10,9 @@ class BasyTecReader:
         self.filepath = filepath
         self.sample_id = sample_id
 
-    def read(self):
+    def read(self, nrows= None):
         metadata = self._extract_metadata()
-        data = self._extract_data()
+        data = self._extract_data(nrows=nrows)
         data = self._map_columns_to_ontology(data)
         if self.sample_id:
             metadata['sample_id'] = self.sample_id
@@ -32,7 +32,7 @@ class BasyTecReader:
                     metadata[std_key] = value.strip()
         return metadata
 
-    def _extract_data(self):
+    def _extract_data(self,nrows=None):
         # Find first line not starting with '#' (column headers), then read data as DataFrame
         with open(self.filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
@@ -44,7 +44,9 @@ class BasyTecReader:
         df = pd.read_csv(
             self.filepath,
             sep=",",
-            skiprows=header_idx,
+            skiprows=header_idx-1,
+            #header=0,
+            nrows=nrows,
             engine="python"
         )
         return df

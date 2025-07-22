@@ -7,6 +7,7 @@
 
 BASYTEC_COLUMN_MAPPING = {
     "Time[s]": "time_s",
+    "#Time[s]": "time_s",
     "DataSet": "dataset_idx",
     "t-Step[s]": "step_time_s",
     "t-Set[s]": "set_time_s",

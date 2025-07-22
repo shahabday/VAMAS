@@ -11,7 +11,7 @@ file_path = config['basytec_sample_file']
 
 # Create the reader and read data
 reader = BasyTecReader(filepath=file_path, sample_id="test_sample_001")
-result = reader.read()
+result = reader.read(nrows=100)
 
 # Print results
 print("\n--- METADATA ---")
