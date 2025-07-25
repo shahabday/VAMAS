@@ -1,0 +1,140 @@
+import pandas as pd
+import numpy as np
+
+class Preprocessor:
+    """
+    Preprocessor for battery experiment data.
+    - Segments OCV, charge, and discharge steps (currently for CC/CV protocols)
+    - Computes a summary DOE/steps table
+    - Adds C-rate estimation if cell capacity is known/assumed
+    """
+
+    def __init__(self, df: pd.DataFrame, cell_capacity_ah: float = 1.0):
+        """
+        Initialize with raw dataframe (after column mapping) and optional cell capacity.
+        """
+        self.df = df.copy()
+        self.cell_capacity_ah = cell_capacity_ah or 1.0
+        self.segmented = None
+        self.steps_df = None
+        self.steps_df_clean = None
+        self.metadata = {}
+    
+    def segment_cc_cv_threshold(self, current_col='current_a', voltage_col='voltage_v', step_col='step_number'):
+        """
+        Segment CC/CV/OCV steps based on current/voltage thresholds, marking each row.
+        """
+        epsilon = 0.001  # voltage threshold (V)
+        current_thr = 0.01  # OCV threshold (A)
+        df = self.df.copy()
+        df['cc_cv'] = None
+
+        for step, group in df.groupby(step_col):
+            idx = group.index
+            current = group[current_col]
+            voltage = group[voltage_col]
+            # 1. OCV
+            if current.abs().mean() < current_thr:
+                df.loc[idx, 'cc_cv'] = 'OCV'
+            # 2. Charge (mean current > 0)
+            elif current.mean() > 0:
+                v_max = voltage.max()
+                cv_start = idx[(voltage >= v_max - epsilon)][0]
+                df.loc[idx[idx < cv_start], 'cc_cv'] = 'CC'
+                df.loc[idx[idx >= cv_start], 'cc_cv'] = 'CV'
+            # 3. Discharge (mean current < 0)
+            elif current.mean() < 0:
+                v_min = voltage.min()
+                cv_start = idx[(voltage <= v_min + epsilon)][0]
+                df.loc[idx[idx < cv_start], 'cc_cv'] = 'CC'
+                df.loc[idx[idx >= cv_start], 'cc_cv'] = 'CV'
+            else:
+                df.loc[idx, 'cc_cv'] = 'Other'
+        self.segmented = df
+        return df
+
+    def make_steps_summary(self, step_col='step_number', cc_cv_col='cc_cv', voltage_col='voltage_v', current_col='current_a'):
+        """
+        Generate a summary table of all steps (DOE table) from segmented data.
+        """
+        if self.segmented is None:
+            raise ValueError("Run segment_cc_cv_threshold() first!")
+
+        step_summaries = []
+        for step_no, step_df in self.segmented.groupby(step_col):
+            step_type = step_df[cc_cv_col].iloc[0]
+            start_time = step_df['time_s'].iloc[0]
+            end_time = step_df['time_s'].iloc[-1]
+            duration = end_time - start_time
+
+            param_dict = {
+                'step_number': step_no,
+                'step_type': step_type,
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration_s': duration
+            }
+            # OCV summary
+            if step_type == 'OCV':
+                param_dict['mean_voltage'] = step_df[voltage_col].mean()
+                param_dict['mean_current'] = step_df[current_col].mean()
+            # Charge/Discharge summaries
+            elif step_type in ['charge', 'discharge']:
+                # Add logic as you had for charge/discharge, possibly refactor if needed.
+                cc_mask = step_df[cc_cv_col] == 'CC'
+                cv_mask = step_df[cc_cv_col] == 'CV'
+                prefix = step_type
+
+                if cc_mask.any():
+                    param_dict[f'{prefix}_cc_current'] = step_df.loc[cc_mask, current_col].mean()
+                    param_dict[f'{prefix}_cc_duration'] = step_df.loc[cc_mask, 'time_s'].iloc[-1] - step_df.loc[cc_mask, 'time_s'].iloc[0]
+                    param_dict[f'{prefix}_cc_cutoff_voltage'] = step_df.loc[cc_mask, voltage_col].max() if prefix == 'charge' else step_df.loc[cc_mask, voltage_col].min()
+                if cv_mask.any():
+                    param_dict[f'{prefix}_cv_voltage'] = step_df.loc[cv_mask, voltage_col].mean()
+                    param_dict[f'{prefix}_cv_duration'] = step_df.loc[cv_mask, 'time_s'].iloc[-1] - step_df.loc[cv_mask, 'time_s'].iloc[0]
+                    param_dict[f'{prefix}_cv_cutoff_current'] = step_df.loc[cv_mask, current_col].abs().min()
+
+            step_summaries.append(param_dict)
+        self.steps_df = pd.DataFrame(step_summaries)
+        return self.steps_df
+
+    def clean_steps(self, min_duration=0.5):
+        """
+        Remove steps shorter than min_duration (in seconds).
+        """
+        if self.steps_df is None:
+            raise ValueError("Run make_steps_summary() first!")
+        self.steps_df_clean = self.steps_df[self.steps_df['duration_s'] > min_duration].reset_index(drop=True)
+        return self.steps_df_clean
+
+    def estimate_c_rate(self):
+        """
+        Estimate C-rate for each step, using provided/assumed cell capacity.
+        """
+        if self.steps_df_clean is None:
+            raise ValueError("Run clean_steps() first!")
+        steps = self.steps_df_clean
+        cap = self.cell_capacity_ah
+        def get_c_rate(current):
+            return current / cap if cap else None
+        steps['c_rate'] = None
+        for i, row in steps.iterrows():
+            if row['step_type'] == 'charge' and not pd.isna(row.get('charge_cc_current', None)):
+                steps.at[i, 'c_rate'] = get_c_rate(row['charge_cc_current'])
+            elif row['step_type'] == 'discharge' and not pd.isna(row.get('discharge_cc_current', None)):
+                steps.at[i, 'c_rate'] = get_c_rate(abs(row['discharge_cc_current']))
+        self.steps_df_clean = steps
+        return steps
+
+    def process_all(self):
+        """
+        Run full pipeline: segment, summarize, clean, estimate c-rate.
+        """
+        self.segment_cc_cv_threshold()
+        self.make_steps_summary()
+        self.clean_steps()
+        self.estimate_c_rate()
+        return self.segmented, self.steps_df_clean
+
+    # --- Export methods for DB, visualization, etc. can be added here ---
+
