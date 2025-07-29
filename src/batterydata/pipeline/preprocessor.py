@@ -19,6 +19,27 @@ class Preprocessor:
         self.steps_df = None
         self.steps_df_clean = None
         self.metadata = {}
+
+    def detect_steps(self, classify_fn=None):
+        """
+        Label each row with step_type and step_number.
+        """
+        if classify_fn is None:
+            classify_fn = self._default_classify_row
+        self.df['step_type'] = self.df.apply(classify_fn, axis=1)
+        step_change = self.df['step_type'] != self.df['step_type'].shift(1)
+        self.df['step_number'] = step_change.cumsum()
+        return self.df
+
+    def _default_classify_row(self, row):
+        if abs(row['current_a']) < self.current_threshold:
+            return "OCV"
+        elif row['current_a'] > 0:
+            return "charge"
+        elif row['current_a'] < 0:
+            return "discharge"
+        else:
+            return "unknown"
     
     def segment_cc_cv_threshold(self, current_col='current_a', voltage_col='voltage_v', step_col='step_number'):
         """
@@ -130,11 +151,12 @@ class Preprocessor:
         """
         Run full pipeline: segment, summarize, clean, estimate c-rate.
         """
+        self.detect_steps()
         self.segment_cc_cv_threshold()
         self.make_steps_summary()
         self.clean_steps()
         self.estimate_c_rate()
         return self.segmented, self.steps_df_clean
 
-    # --- Export methods for DB, visualization, etc. can be added here ---
+    
 
