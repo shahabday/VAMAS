@@ -9,15 +9,17 @@ class Preprocessor:
     - Adds C-rate estimation if cell capacity is known/assumed
     """
 
-    def __init__(self, df: pd.DataFrame, cell_capacity_ah: float = 1.0):
+    def __init__(self, df: pd.DataFrame, cell_capacity_ah: float = 1.0,current_threshold=0.01):
         """
         Initialize with raw dataframe (after column mapping) and optional cell capacity.
         """
         self.df = df.copy()
         self.cell_capacity_ah = cell_capacity_ah or 1.0
+        self.current_threshold = current_threshold
         self.segmented = None
         self.steps_df = None
         self.steps_df_clean = None
+
         self.metadata = {}
 
     def detect_steps(self, classify_fn=None):
@@ -46,7 +48,7 @@ class Preprocessor:
         Segment CC/CV/OCV steps based on current/voltage thresholds, marking each row.
         """
         epsilon = 0.001  # voltage threshold (V)
-        current_thr = 0.01  # OCV threshold (A)
+        current_thr = self.current_threshold  # OCV threshold (A)
         df = self.df.copy()
         df['cc_cv'] = None
 
