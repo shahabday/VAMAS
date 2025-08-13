@@ -79,13 +79,37 @@ class Preprocessor:
     def make_steps_summary(self, step_col='step_number', cc_cv_col='cc_cv', voltage_col='voltage_v', current_col='current_a'):
         """
         Generate a summary table of all steps (DOE table) from segmented data.
+        
+        Parameters
+        ----------
+        step_col : str, optional
+            Column name representing the step number (default: 'step_number').
+        cc_cv_col : str, optional
+            Column name with CC/CV/OCV classification (default: 'cc_cv').
+        voltage_col : str, optional
+            Column name for voltage (default: 'voltage_v').
+        current_col : str, optional
+            Column name for current (default: 'current_a').
+
+        Returns
+        -------
+        pandas.DataFrame
+            Summary table (DOE table) with one row per step, including:
+            - Basic timing info (`start_time`, `end_time`, `duration_s`)
+            - Mean voltage/current for OCV steps
+            - CC/CV parameters for charge and discharge steps
+            - New field `cc_cv_mode` indicating:
+                'CC'   → step contains only constant current region
+                'CV'   → step contains only constant voltage region
+                'CCCV' → step contains both regions
+                None   → step not classified as charge or discharge
         """
         if self.segmented is None:
             raise ValueError("Run segment_cc_cv_threshold() first!")
 
         step_summaries = []
         for step_no, step_df in self.segmented.groupby(step_col):
-            step_type = step_df[cc_cv_col].iloc[0]
+            step_type = step_df["step_type"].iloc[0]  # Step type from detect_steps()
             start_time = step_df['time_s'].iloc[0]
             end_time = step_df['time_s'].iloc[-1]
             duration = end_time - start_time
@@ -97,29 +121,49 @@ class Preprocessor:
                 'end_time': end_time,
                 'duration_s': duration
             }
+
+            # Default cc_cv_mode
+            cc_cv_mode = None
+
             # OCV summary
             if step_type == 'OCV':
                 param_dict['mean_voltage'] = step_df[voltage_col].mean()
                 param_dict['mean_current'] = step_df[current_col].mean()
+
             # Charge/Discharge summaries
             elif step_type in ['charge', 'discharge']:
-                # Add logic as you had for charge/discharge, possibly refactor if needed.
                 cc_mask = step_df[cc_cv_col] == 'CC'
                 cv_mask = step_df[cc_cv_col] == 'CV'
                 prefix = step_type
 
+                # Determine CC/CV composition
+                if cc_mask.any() and not cv_mask.any():
+                    cc_cv_mode = 'CC'
+                elif cv_mask.any() and not cc_mask.any():
+                    cc_cv_mode = 'CV'
+                elif cc_mask.any() and cv_mask.any():
+                    cc_cv_mode = 'CCCV'
+
                 if cc_mask.any():
                     param_dict[f'{prefix}_cc_current'] = step_df.loc[cc_mask, current_col].mean()
                     param_dict[f'{prefix}_cc_duration'] = step_df.loc[cc_mask, 'time_s'].iloc[-1] - step_df.loc[cc_mask, 'time_s'].iloc[0]
-                    param_dict[f'{prefix}_cc_cutoff_voltage'] = step_df.loc[cc_mask, voltage_col].max() if prefix == 'charge' else step_df.loc[cc_mask, voltage_col].min()
+                    param_dict[f'{prefix}_cc_cutoff_voltage'] = (
+                        step_df.loc[cc_mask, voltage_col].max()
+                        if prefix == 'charge' else step_df.loc[cc_mask, voltage_col].min()
+                    )
                 if cv_mask.any():
                     param_dict[f'{prefix}_cv_voltage'] = step_df.loc[cv_mask, voltage_col].mean()
                     param_dict[f'{prefix}_cv_duration'] = step_df.loc[cv_mask, 'time_s'].iloc[-1] - step_df.loc[cv_mask, 'time_s'].iloc[0]
                     param_dict[f'{prefix}_cv_cutoff_current'] = step_df.loc[cv_mask, current_col].abs().min()
 
+            # Add CC/CV mode field
+            param_dict['cc_cv_mode'] = cc_cv_mode
+
             step_summaries.append(param_dict)
+
         self.steps_df = pd.DataFrame(step_summaries)
         return self.steps_df
+
 
     def clean_steps(self, min_duration=0.5):
         """
