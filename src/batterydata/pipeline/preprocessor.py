@@ -46,35 +46,99 @@ class Preprocessor:
     def segment_cc_cv_threshold(self, current_col='current_a', voltage_col='voltage_v', step_col='step_number'):
         """
         Segment CC/CV/OCV steps based on current/voltage thresholds, marking each row.
-        """
-        epsilon = 0.001  # voltage threshold (V)
-        current_thr = self.current_threshold  # OCV threshold (A)
-        df = self.df.copy()
-        df['cc_cv'] = None
 
-        for step, group in df.groupby(step_col):
+        Logic
+        -----
+        - OCV: mean(|I|) < self.current_threshold  → label entire step 'OCV'
+        - Charge: mean(I) > 0; CV starts when V >= (V_max - epsilon)
+        - Discharge: mean(I) < 0; CV starts when V <= (V_min + epsilon)
+        - A provisional CV region must persist for at least `min_cv_duration_s`
+        (contiguous in time) to be considered valid; otherwise the whole step is 'CC'.
+
+        Notes
+        -----
+        - Requires 'step_number' and 'time_s' columns (created earlier in the pipeline).
+        - Numeric NaNs propagate naturally.
+        """
+        import pandas as pd
+
+        epsilon = 0.001  # voltage proximity (V) to declare CV
+        current_thr = self.current_threshold  # OCV threshold (A)
+        min_cv_duration_s = getattr(self, 'min_cv_duration_s', 2.0)  # default if not set on the class
+
+        df = self.df.copy()
+        df['cc_cv'] = pd.Series(index=df.index, dtype='object')
+
+        def _enforce_min_cv_duration(step_sub, provisional_cv_mask):
+            """
+            Returns (ok_bool, first_cv_label_index) for the first contiguous CV block
+            that starts at the first True in provisional_cv_mask and lasts at least
+            min_cv_duration_s seconds. If not ok, returns (False, first_label_or_None).
+            """
+            if not provisional_cv_mask.any():
+                return False, None
+
+            first_cv_label = provisional_cv_mask[provisional_cv_mask].index[0]
+
+            after = step_sub.loc[first_cv_label:]
+            after_mask = provisional_cv_mask.loc[first_cv_label:]
+
+            # Cut the contiguous True block starting at first_cv_label
+            if (~after_mask).any():
+                first_false_label = after_mask[~after_mask].index[0]
+                cont_block = step_sub.loc[first_cv_label:first_false_label].iloc[:-1]  # exclude the False
+            else:
+                cont_block = after
+
+            if len(cont_block) <= 1:
+                return False, first_cv_label
+
+            duration = cont_block['time_s'].iloc[-1] - cont_block['time_s'].iloc[0]
+            return duration >= min_cv_duration_s, first_cv_label
+
+        # Process each step independently
+        for step, group in df.groupby(step_col, sort=False):
             idx = group.index
             current = group[current_col]
             voltage = group[voltage_col]
-            # 1. OCV
+
+            # 1) OCV: mean |I| below threshold
             if current.abs().mean() < current_thr:
                 df.loc[idx, 'cc_cv'] = 'OCV'
-            # 2. Charge (mean current > 0)
-            elif current.mean() > 0:
+                continue
+
+            # 2) Charge: mean I > 0  → CV near V_max
+            if current.mean() > 0:
                 v_max = voltage.max()
-                cv_start = idx[(voltage >= v_max - epsilon)][0]
-                df.loc[idx[idx < cv_start], 'cc_cv'] = 'CC'
-                df.loc[idx[idx >= cv_start], 'cc_cv'] = 'CV'
-            # 3. Discharge (mean current < 0)
-            elif current.mean() < 0:
+                provisional_cv_mask = (voltage >= (v_max - epsilon))
+                ok, cv_start_label = _enforce_min_cv_duration(group, provisional_cv_mask)
+
+                if ok:
+                    df.loc[idx[idx < cv_start_label], 'cc_cv'] = 'CC'
+                    df.loc[idx[idx >= cv_start_label], 'cc_cv'] = 'CV'
+                else:
+                    df.loc[idx, 'cc_cv'] = 'CC'
+                continue
+
+            # 3) Discharge: mean I < 0 → CV near V_min
+            if current.mean() < 0:
                 v_min = voltage.min()
-                cv_start = idx[(voltage <= v_min + epsilon)][0]
-                df.loc[idx[idx < cv_start], 'cc_cv'] = 'CC'
-                df.loc[idx[idx >= cv_start], 'cc_cv'] = 'CV'
-            else:
-                df.loc[idx, 'cc_cv'] = 'Other'
+                provisional_cv_mask = (voltage <= (v_min + epsilon))
+                ok, cv_start_label = _enforce_min_cv_duration(group, provisional_cv_mask)
+
+                if ok:
+                    df.loc[idx[idx < cv_start_label], 'cc_cv'] = 'CC'
+                    df.loc[idx[idx >= cv_start_label], 'cc_cv'] = 'CV'
+                else:
+                    df.loc[idx, 'cc_cv'] = 'CC'
+                continue
+
+            # Fallback
+            df.loc[idx, 'cc_cv'] = 'Other'
+
         self.segmented = df
         return df
+
 
     def make_steps_summary(self, step_col='step_number', cc_cv_col='cc_cv', voltage_col='voltage_v', current_col='current_a'):
         """
