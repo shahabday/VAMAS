@@ -9,7 +9,7 @@ class Preprocessor:
     - Adds C-rate estimation if cell capacity is known/assumed
     """
 
-    def __init__(self, df: pd.DataFrame, cell_capacity_ah: float = 1.0,current_threshold=0.01):
+    def __init__(self, df: pd.DataFrame, cell_capacity_ah: float = 1.0,current_threshold=0.01 , min_V = 0.001):
         """
         Initialize with raw dataframe (after column mapping) and optional cell capacity.
         """
@@ -19,6 +19,7 @@ class Preprocessor:
         self.segmented = None
         self.steps_df = None
         self.steps_df_clean = None
+        self.epsilon = min_V # this is the threshold to detect constant Voltage for CV phase
 
         self.metadata = {}
 
@@ -62,8 +63,9 @@ class Preprocessor:
         """
         import pandas as pd
 
-        epsilon = 0.001  # voltage proximity (V) to declare CV
+        epsilon = self.epsilon # voltage proximity (V) to declare CV
         current_thr = self.current_threshold  # OCV threshold (A)
+
         min_cv_duration_s = getattr(self, 'min_cv_duration_s', 2.0)  # default if not set on the class
 
         df = self.df.copy()
