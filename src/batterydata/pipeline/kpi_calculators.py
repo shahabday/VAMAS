@@ -107,35 +107,27 @@ def _sum_measured_step_ah_over_runs(df: pd.DataFrame, step_kind: str) -> Tuple[f
     s.drop(columns=["_step_lc", "_run"], inplace=True, errors="ignore")
     return float(total_Q), {"runs": runs, "rows": rows}
 
-
 def _sum_duration_by_mask(raw: pd.DataFrame, mask: pd.Series) -> float:
     """
     Sum duration in seconds over rows where `mask` is True.
-
-    Calculation:
-      After sorting by time, we compute dt = t[i+1]-t[i] and sum dt where
-      both adjacent samples satisfy the mask and dt > 0.
-
-    Required columns:
-      - time_s (float seconds)
-
-    Purpose:
-      Provide robust durations for arbitrary logical selections
-      (e.g., charge-only, 'charge & CV', etc.) without integrating across
-      gaps or non-positive dt regions.
+    Robust to sorting: we realign the mask to the sorted frame by index.
     """
     if raw.empty:
         return 0.0
-    w = raw[["time_s"]].copy()
-    w["__mask__"] = mask.values
-    w = w.dropna(subset=["time_s"]).sort_values("time_s")
+
+    w = raw[["time_s"]].dropna().copy()
+    w = w.sort_values("time_s")
+    # REALIGN the mask to the sorted index (avoid mask.values!)
+    m = mask.reindex(w.index).fillna(False).astype(bool).to_numpy()
+
     if len(w) < 2:
         return 0.0
+
     t = w["time_s"].to_numpy()
-    m = w["__mask__"].to_numpy().astype(bool)
     dt = np.diff(t)
     valid = (dt > 0) & m[:-1] & m[1:]
     return float(np.sum(dt[valid]))
+
 
 def _extract_ids(ctx: CycleContext) -> None:
     """
@@ -199,18 +191,30 @@ class CycleContext:
         return self.ids.get("block_id"), self.ids.get("cycle_index")
 
 
-
 def _compute_basis(ctx: CycleContext) -> None:
     """
-    Compute once per cycle; cache Q/E for charge & discharge, plus flags.
-    Expects raw columns: time_s, current_a, voltage_v, step_type
+    Compute once per cycle and cache core basis + CC/CV-aware features.
+
+    Core basis (from raw, robust trapezoids):
+      - Q_charge_Ah, E_charge_Wh, Q_discharge_Ah, E_discharge_Wh
+      - flags: has_charge, has_discharge, is_partial_cycle
+      - debug_stats: runs/rows/pairs per step_type
+      - measured device sums (optional): Q_charge_Ah_meas, Q_discharge_Ah_meas
+
+    CC/CV-aware features (if 'cc_cv' exists):
+      - Charge_total_duration_s, Discharge_total_duration_s
+      - Charge_CV_duration_s
+      - Q_charge_Ah_CV, Q_charge_Ah_CC
+      - Q_charge_Ah_by_cccv (denominator for ratios = CV+CC capacity)
+      - cccv_vs_total_mismatch_% (diagnostic vs total charge Q)
     """
+    # --- Required raw columns for core basis ---
     required = {"time_s", "current_a", "voltage_v", "step_type"}
     missing = required - set(ctx.raw.columns)
     if missing:
         raise KeyError(f"raw_cycle_df missing required columns: {missing}")
 
-    # Integrated from raw
+    # === Core basis: integrated from raw by step_type ===
     Qc, Ec, statsC = _sum_over_contiguous_runs(ctx.raw, "charge")
     Qd, Ed, statsD = _sum_over_contiguous_runs(ctx.raw, "discharge")
 
@@ -218,55 +222,83 @@ def _compute_basis(ctx: CycleContext) -> None:
     Qc_meas, statsC_meas = _sum_measured_step_ah_over_runs(ctx.raw, "charge")
     Qd_meas, statsD_meas = _sum_measured_step_ah_over_runs(ctx.raw, "discharge")
 
-    # ---- CC/CV-aware durations and CV capacity (optional if 'cc_cv' exists) ----
-    # Defaults in case 'cc_cv' column is missing
-    ctx.cache.setdefault("Charge_total_duration_s", float("nan"))
-    ctx.cache.setdefault("Discharge_total_duration_s", float("nan"))
-    ctx.cache.setdefault("Charge_CV_duration_s", float("nan"))
-    ctx.cache.setdefault("Q_charge_Ah_CV", float("nan"))
-    ctx.cache["has_cc_cv_column"] = "cc_cv" in ctx.raw.columns
+    has_charge = statsC["runs"] > 0
+    has_discharge = statsD["runs"] > 0
+    is_partial_cycle = not (has_charge and has_discharge)
 
-    # Total durations by step_type (time_s and step_type required)
+    debug_stats = {
+        "charge":    {**statsC, "meas_runs": statsC_meas["runs"], "meas_rows": statsC_meas["rows"]},
+        "discharge": {**statsD, "meas_runs": statsD_meas["runs"], "meas_rows": statsD_meas["rows"]},
+    }
+
+    # === Defaults for CC/CV-aware entries ===
+    charge_total_dur_s = float("nan")
+    discharge_total_dur_s = float("nan")
+    charge_cv_dur_s = float("nan")
+    q_charge_cv = float("nan")
+    q_charge_cc = float("nan")
+    q_charge_by_cccv = float("nan")
+    mismatch_pct = float("nan")
+
+    # === Compute durations by step_type (time_s + step_type) ===
     if {"time_s", "step_type"}.issubset(ctx.raw.columns):
         step_lc = ctx.raw["step_type"].astype(str).str.lower()
-        dur_charge = _sum_duration_by_mask(ctx.raw, step_lc.eq("charge"))
-        dur_dis    = _sum_duration_by_mask(ctx.raw, step_lc.eq("discharge"))
-        ctx.cache.update({
-            "Charge_total_duration_s": dur_charge,
-            "Discharge_total_duration_s": dur_dis,
-        })
+        charge_total_dur_s = _sum_duration_by_mask(ctx.raw, step_lc.eq("charge"))
+        discharge_total_dur_s = _sum_duration_by_mask(ctx.raw, step_lc.eq("discharge"))
 
-    # CV-specific metrics (need 'cc_cv')
-    if ctx.cache["has_cc_cv_column"]:
+    # === CC/CV metrics only if 'cc_cv' exists ===
+    has_cc_cv_col = "cc_cv" in ctx.raw.columns
+    if has_cc_cv_col:
         step_lc = ctx.raw["step_type"].astype(str).str.lower()
-        mode_lc = ctx.raw["cc_cv"].astype(str).str.upper()
-        mask_charge_cv = step_lc.eq("charge") & mode_lc.eq("CV")
+        mode_uc = ctx.raw["cc_cv"].astype(str).str.strip().str.upper()
 
-        # CV duration during charge
-        ctx.cache["Charge_CV_duration_s"] = _sum_duration_by_mask(ctx.raw, mask_charge_cv)
+        mask_charge_cv = step_lc.eq("charge") & mode_uc.eq("CV")
+        mask_charge_cc = step_lc.eq("charge") & mode_uc.eq("CC")
 
-        # CV capacity during charge: integrate only the masked rows
-        # (reuses your robust integrator on the filtered subset)
-        sub = ctx.raw.loc[mask_charge_cv]
-        if {"time_s", "current_a", "voltage_v"}.issubset(sub.columns) and not sub.empty:
-            Qcv, _, _, _ = _integrate_trapz_abs(sub)
-            ctx.cache["Q_charge_Ah_CV"] = Qcv
+        # CV duration during charge (robust mask alignment)
+        charge_cv_dur_s = _sum_duration_by_mask(ctx.raw, mask_charge_cv)
 
+        # Capacities by partition (subset raw and reuse integrator)
+        sub_cv = ctx.raw.loc[mask_charge_cv]
+        sub_cc = ctx.raw.loc[mask_charge_cc]
 
+        if not sub_cv.empty and {"time_s","current_a","voltage_v"}.issubset(sub_cv.columns):
+            q_charge_cv, _, _, _ = _integrate_trapz_abs(sub_cv)
+        if not sub_cc.empty and {"time_s","current_a","voltage_v"}.issubset(sub_cc.columns):
+            q_charge_cc, _, _, _ = _integrate_trapz_abs(sub_cc)
+
+        # Partition-consistent denominator
+        denom = (q_charge_cv if np.isfinite(q_charge_cv) else 0.0) + \
+                (q_charge_cc if np.isfinite(q_charge_cc) else 0.0)
+        q_charge_by_cccv = denom if denom > 0 else float("nan")
+
+        # Diagnostic vs total charge capacity (use local Qc, not cache)
+        if np.isfinite(Qc) and Qc > 0 and np.isfinite(denom):
+            mismatch_pct = 100.0 * abs(denom - Qc) / Qc
+
+    # === Write everything to cache (single update) ===
     ctx.cache.update({
+        # Core basis
         "Q_charge_Ah": Qc,
         "E_charge_Wh": Ec,
         "Q_discharge_Ah": Qd,
         "E_discharge_Wh": Ed,
-        "Q_charge_Ah_meas": Qc_meas,              # may be NaN if column missing
-        "Q_discharge_Ah_meas": Qd_meas,           # may be NaN if column missing
-        "has_charge": statsC["runs"] > 0,
-        "has_discharge": statsD["runs"] > 0,
-        "is_partial_cycle": not (statsC["runs"] > 0 and statsD["runs"] > 0),
-        "debug_stats": {
-            "charge":    {**statsC, "meas_runs": statsC_meas["runs"], "meas_rows": statsC_meas["rows"]},
-            "discharge": {**statsD, "meas_runs": statsD_meas["runs"], "meas_rows": statsD_meas["rows"]},
-        },
+        "Q_charge_Ah_meas": Qc_meas,        # may be NaN if column missing
+        "Q_discharge_Ah_meas": Qd_meas,     # may be NaN if column missing
+        "has_charge": has_charge,
+        "has_discharge": has_discharge,
+        "is_partial_cycle": is_partial_cycle,
+        "debug_stats": debug_stats,
+
+        # Durations and CC/CV-aware features
+        "Charge_total_duration_s": charge_total_dur_s,
+        "Discharge_total_duration_s": discharge_total_dur_s,
+        "Charge_CV_duration_s": charge_cv_dur_s,
+        "Q_charge_Ah_CV": q_charge_cv,
+        "Q_charge_Ah_CC": q_charge_cc,
+        "Q_charge_Ah_by_cccv": q_charge_by_cccv,
+        "cccv_vs_total_mismatch_%": mismatch_pct,
+        "has_cc_cv_column": has_cc_cv_col,
     })
 
 
@@ -416,35 +448,42 @@ class ChargeCVTimeRatio:
         val = float(cv / total) if (isinstance(total, (int, float)) and total > 0) else float("nan")
         return {self.name: val}
 
-
 @dataclass
 class ChargeCVCapacityRatio:
     """
-    Charge_CV_capacity_ratio: fraction of charge capacity delivered in CV (0..1).
-
-    Calculation:
-      Q_charge_Ah_CV / Q_charge_Ah
-      where Q_charge_Ah_CV is capacity integrated only over charge rows with cc_cv == 'CV'.
-
-    Required basis:
-      - Q_charge_Ah_CV
-      - Q_charge_Ah
-
-    Required columns (raw to build basis):
-      - time_s, current_a, voltage_v, step_type, cc_cv
+    Charge_CV_capacity_ratio (0..1):
+      = Q_charge_Ah_CV / (Q_charge_Ah_CV + Q_charge_Ah_CC)
+    Falls back to Q_charge_Ah total if CC/CV split is unavailable.
 
     Purpose:
-      Capacity-based view of CV dominance; complements time ratio by
-      focusing on what portion of charge throughput occurs under CV control.
+      Capacity-based view of CV dominance, robust to timing glitches that
+      could bias the whole-charge integral.
     """
     name: str = "Charge_CV_capacity_ratio"
-    requires_basis: Tuple[str, ...] = ("Q_charge_Ah_CV", "Q_charge_Ah")
+    requires_basis: Tuple[str, ...] = ("Q_charge_Ah_CV", "Q_charge_Ah_by_cccv")
 
     def compute(self, ctx: CycleContext) -> Dict[str, Any]:
         qcv = ctx.cache["Q_charge_Ah_CV"]
-        qt = ctx.cache["Q_charge_Ah"]
-        val = float(qcv / qt) if (isinstance(qt, (int, float)) and qt > 0) else float("nan")
+        denom = ctx.cache["Q_charge_Ah_by_cccv"]
+
+        # Fallback if split unavailable
+        if not np.isfinite(denom) or denom <= 0:
+            qt = ctx.cache.get("Q_charge_Ah", float("nan"))
+            val = float(qcv / qt) if (np.isfinite(qt) and qt > 0) else float("nan")
+            return {self.name: val}
+
+        val = float(qcv / denom) if (np.isfinite(qcv) and denom > 0) else float("nan")
         return {self.name: val}
+
+@dataclass
+class CCVTotalMismatchPct:
+    """Diagnostic: |(Q_CV + Q_CC) - Q_total| / Q_total * 100 [%]"""
+    name: str = "cccv_vs_total_mismatch_%"
+    requires_basis: Tuple[str, ...] = ("cccv_vs_total_mismatch_%",)
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        return {self.name: float(ctx.cache["cccv_vs_total_mismatch_%"])}
+
 
 # ----------------------------
 # Energy efficiency & average voltages
