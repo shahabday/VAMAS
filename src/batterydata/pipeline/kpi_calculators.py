@@ -5,30 +5,9 @@ from typing import Dict, Any, List, Tuple, Protocol, Optional
 import numpy as np
 import pandas as pd
 
-
-# ======================================================================
-# Single-cycle engine (no ontology): integrates Q/E, computes KPIs you request
-# ======================================================================
-
-class SingleCycleKPI(Protocol):
-    """A KPI unit that uses the single-cycle context and returns a dict."""
-    name: str
-    requires_basis: Tuple[str, ...]  # entries expected in ctx.cache
-
-    def compute(self, ctx: "CycleContext") -> Dict[str, Any]:
-        ...
-
-
-@dataclass
-class CycleContext:
-    """Holds everything a KPI unit may need for one cycle."""
-    raw: pd.DataFrame  # rows for exactly one cycle (charge/OCV/discharge)
-    doe: pd.DataFrame  # DOE rows for the same cycle
-    ids: Dict[str, Any] = field(default_factory=dict)    # block_id, cycle_index
-    cache: Dict[str, Any] = field(default_factory=dict)  # basis features & flags
-
-    def get_id_tuple(self) -> Tuple[Any, Any]:
-        return self.ids.get("block_id"), self.ids.get("cycle_index")
+# =================================================================================
+# Helper Functions 
+# =================================================================================
 
 
 def _integrate_trapz_abs(df: pd.DataFrame) -> Tuple[float, float, int, int]:
@@ -129,6 +108,35 @@ def _sum_measured_step_ah_over_runs(df: pd.DataFrame, step_kind: str) -> Tuple[f
     return float(total_Q), {"runs": runs, "rows": rows}
 
 
+def _sum_duration_by_mask(raw: pd.DataFrame, mask: pd.Series) -> float:
+    """
+    Sum duration in seconds over rows where `mask` is True.
+
+    Calculation:
+      After sorting by time, we compute dt = t[i+1]-t[i] and sum dt where
+      both adjacent samples satisfy the mask and dt > 0.
+
+    Required columns:
+      - time_s (float seconds)
+
+    Purpose:
+      Provide robust durations for arbitrary logical selections
+      (e.g., charge-only, 'charge & CV', etc.) without integrating across
+      gaps or non-positive dt regions.
+    """
+    if raw.empty:
+        return 0.0
+    w = raw[["time_s"]].copy()
+    w["__mask__"] = mask.values
+    w = w.dropna(subset=["time_s"]).sort_values("time_s")
+    if len(w) < 2:
+        return 0.0
+    t = w["time_s"].to_numpy()
+    m = w["__mask__"].to_numpy().astype(bool)
+    dt = np.diff(t)
+    valid = (dt > 0) & m[:-1] & m[1:]
+    return float(np.sum(dt[valid]))
+
 def _extract_ids(ctx: CycleContext) -> None:
     """
     Fill ctx.ids with cycle_index and block_id, preferring DOE; fallback to RAW.
@@ -166,6 +174,31 @@ def _extract_ids(ctx: CycleContext) -> None:
     ctx.ids["cycle_index"] = cyc_val
     ctx.ids["block_id"] = blk_val
 
+# ======================================================================
+# Single-cycle engine (no ontology): integrates Q/E, computes KPIs you request
+# ======================================================================
+
+class SingleCycleKPI(Protocol):
+    """A KPI unit that uses the single-cycle context and returns a dict."""
+    name: str
+    requires_basis: Tuple[str, ...]  # entries expected in ctx.cache
+
+    def compute(self, ctx: "CycleContext") -> Dict[str, Any]:
+        ...
+
+
+@dataclass
+class CycleContext:
+    """Holds everything a KPI unit may need for one cycle."""
+    raw: pd.DataFrame  # rows for exactly one cycle (charge/OCV/discharge)
+    doe: pd.DataFrame  # DOE rows for the same cycle
+    ids: Dict[str, Any] = field(default_factory=dict)    # block_id, cycle_index
+    cache: Dict[str, Any] = field(default_factory=dict)  # basis features & flags
+
+    def get_id_tuple(self) -> Tuple[Any, Any]:
+        return self.ids.get("block_id"), self.ids.get("cycle_index")
+
+
 
 def _compute_basis(ctx: CycleContext) -> None:
     """
@@ -184,6 +217,41 @@ def _compute_basis(ctx: CycleContext) -> None:
     # Device-measured step Ah (optional)
     Qc_meas, statsC_meas = _sum_measured_step_ah_over_runs(ctx.raw, "charge")
     Qd_meas, statsD_meas = _sum_measured_step_ah_over_runs(ctx.raw, "discharge")
+
+    # ---- CC/CV-aware durations and CV capacity (optional if 'cc_cv' exists) ----
+    # Defaults in case 'cc_cv' column is missing
+    ctx.cache.setdefault("Charge_total_duration_s", float("nan"))
+    ctx.cache.setdefault("Discharge_total_duration_s", float("nan"))
+    ctx.cache.setdefault("Charge_CV_duration_s", float("nan"))
+    ctx.cache.setdefault("Q_charge_Ah_CV", float("nan"))
+    ctx.cache["has_cc_cv_column"] = "cc_cv" in ctx.raw.columns
+
+    # Total durations by step_type (time_s and step_type required)
+    if {"time_s", "step_type"}.issubset(ctx.raw.columns):
+        step_lc = ctx.raw["step_type"].astype(str).str.lower()
+        dur_charge = _sum_duration_by_mask(ctx.raw, step_lc.eq("charge"))
+        dur_dis    = _sum_duration_by_mask(ctx.raw, step_lc.eq("discharge"))
+        ctx.cache.update({
+            "Charge_total_duration_s": dur_charge,
+            "Discharge_total_duration_s": dur_dis,
+        })
+
+    # CV-specific metrics (need 'cc_cv')
+    if ctx.cache["has_cc_cv_column"]:
+        step_lc = ctx.raw["step_type"].astype(str).str.lower()
+        mode_lc = ctx.raw["cc_cv"].astype(str).str.upper()
+        mask_charge_cv = step_lc.eq("charge") & mode_lc.eq("CV")
+
+        # CV duration during charge
+        ctx.cache["Charge_CV_duration_s"] = _sum_duration_by_mask(ctx.raw, mask_charge_cv)
+
+        # CV capacity during charge: integrate only the masked rows
+        # (reuses your robust integrator on the filtered subset)
+        sub = ctx.raw.loc[mask_charge_cv]
+        if {"time_s", "current_a", "voltage_v"}.issubset(sub.columns) and not sub.empty:
+            Qcv, _, _, _ = _integrate_trapz_abs(sub)
+            ctx.cache["Q_charge_Ah_CV"] = Qcv
+
 
     ctx.cache.update({
         "Q_charge_Ah": Qc,
@@ -269,6 +337,199 @@ class CoulombicEfficiencyMeasured:
         if np.isfinite(Qc) and np.isfinite(Qd) and Qc > 0:
             return {self.name: float(Qd / Qc)}
         return {self.name: float("nan")}
+
+
+# ----------------------------
+# Duration KPIs
+# ----------------------------
+
+@dataclass
+class ChargeCVDurationSeconds:
+    """
+    Charge_CV_duration_s: total time spent in CV during charge (seconds).
+
+    Calculation:
+      Sum of positive time deltas (dt) across rows where:
+          step_type == 'charge' AND cc_cv == 'CV'
+      (computed robustly in the basis layer).
+
+    Required columns (raw):
+      - time_s, step_type, cc_cv
+
+    Purpose:
+      Tracks how much of the charge step is governed by constant voltage,
+      often increasing as the cell polarizes (useful aging indicator).
+    """
+    name: str = "Charge_CV_duration_s"
+    requires_basis: Tuple[str, ...] = ("Charge_CV_duration_s",)
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        return {self.name: float(ctx.cache["Charge_CV_duration_s"])}
+
+
+@dataclass
+class ChargeTotalDurationSeconds:
+    """
+    Charge_total_duration_s: total charge-step time (seconds).
+
+    Calculation:
+      Sum of positive dt across rows where step_type == 'charge'.
+
+    Required columns (raw):
+      - time_s, step_type
+
+    Purpose:
+      Baseline for time-ratio KPIs; helps diagnose rate changes or pauses.
+    """
+    name: str = "Charge_total_duration_s"
+    requires_basis: Tuple[str, ...] = ("Charge_total_duration_s",)
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        return {self.name: float(ctx.cache["Charge_total_duration_s"])}
+
+# ----------------------------
+# Ratios (time & capacity)
+# ----------------------------
+
+@dataclass
+class ChargeCVTimeRatio:
+    """
+    Charge_CV_time_ratio: fraction of charge time spent in CV (0..1).
+
+    Calculation:
+      Charge_CV_duration_s / Charge_total_duration_s
+
+    Required basis:
+      - Charge_CV_duration_s
+      - Charge_total_duration_s
+
+    Purpose:
+      Time-based view of how dominant the CV phase is during charging.
+      Useful for tracking impedance/polarization drift across cycles.
+    """
+    name: str = "Charge_CV_time_ratio"
+    requires_basis: Tuple[str, ...] = ("Charge_CV_duration_s", "Charge_total_duration_s")
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        cv = ctx.cache["Charge_CV_duration_s"]
+        total = ctx.cache["Charge_total_duration_s"]
+        val = float(cv / total) if (isinstance(total, (int, float)) and total > 0) else float("nan")
+        return {self.name: val}
+
+
+@dataclass
+class ChargeCVCapacityRatio:
+    """
+    Charge_CV_capacity_ratio: fraction of charge capacity delivered in CV (0..1).
+
+    Calculation:
+      Q_charge_Ah_CV / Q_charge_Ah
+      where Q_charge_Ah_CV is capacity integrated only over charge rows with cc_cv == 'CV'.
+
+    Required basis:
+      - Q_charge_Ah_CV
+      - Q_charge_Ah
+
+    Required columns (raw to build basis):
+      - time_s, current_a, voltage_v, step_type, cc_cv
+
+    Purpose:
+      Capacity-based view of CV dominance; complements time ratio by
+      focusing on what portion of charge throughput occurs under CV control.
+    """
+    name: str = "Charge_CV_capacity_ratio"
+    requires_basis: Tuple[str, ...] = ("Q_charge_Ah_CV", "Q_charge_Ah")
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        qcv = ctx.cache["Q_charge_Ah_CV"]
+        qt = ctx.cache["Q_charge_Ah"]
+        val = float(qcv / qt) if (isinstance(qt, (int, float)) and qt > 0) else float("nan")
+        return {self.name: val}
+
+# ----------------------------
+# Energy efficiency & average voltages
+# ----------------------------
+
+@dataclass
+class EnergyEfficiency:
+    """
+    EnergyEfficiency: energy ratio (0..~1+ε) per cycle.
+
+    Calculation:
+      E_discharge_Wh / E_charge_Wh
+      (NaN if E_charge_Wh == 0 or either side missing.)
+
+    Required basis:
+      - E_charge_Wh
+      - E_discharge_Wh
+
+    Purpose:
+      Quantifies round-trip energy efficiency; sensitive to polarization,
+      IR drop, and kinetic losses. Expect values near 1 for healthy cells,
+      slightly <1 due to losses; minor >1 can occur from noise/sampling.
+    """
+    name: str = "EnergyEfficiency"
+    requires_basis: Tuple[str, ...] = ("E_charge_Wh", "E_discharge_Wh")
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        ec = ctx.cache["E_charge_Wh"]
+        ed = ctx.cache["E_discharge_Wh"]
+        val = float(ed / ec) if (isinstance(ec, (int, float)) and ec > 0) else float("nan")
+        return {self.name: val}
+
+
+@dataclass
+class VChargeAvg:
+    """
+    V_charge_avg: average voltage during charge (V).
+
+    Calculation:
+      E_charge_Wh / Q_charge_Ah
+      (NaN if Q_charge_Ah == 0)
+
+    Required basis:
+      - E_charge_Wh
+      - Q_charge_Ah
+
+    Purpose:
+      Compact proxy for polarization changes; increasing average charge
+      voltage across cycles can signal rising impedance.
+    """
+    name: str = "V_charge_avg"
+    requires_basis: Tuple[str, ...] = ("E_charge_Wh", "Q_charge_Ah")
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        q = ctx.cache["Q_charge_Ah"]
+        e = ctx.cache["E_charge_Wh"]
+        val = float(e / q) if (isinstance(q, (int, float)) and q > 0) else float("nan")
+        return {self.name: val}
+
+
+@dataclass
+class VDischargeAvg:
+    """
+    V_discharge_avg: average voltage during discharge (V).
+
+    Calculation:
+      E_discharge_Wh / Q_discharge_Ah
+      (NaN if Q_discharge_Ah == 0)
+
+    Required basis:
+      - E_discharge_Wh
+      - Q_discharge_Ah
+
+    Purpose:
+      Tracks discharge polarization; decreasing values can indicate
+      increasing internal resistance or degradation.
+    """
+    name: str = "V_discharge_avg"
+    requires_basis: Tuple[str, ...] = ("E_discharge_Wh", "Q_discharge_Ah")
+
+    def compute(self, ctx: CycleContext) -> Dict[str, Any]:
+        q = ctx.cache["Q_discharge_Ah"]
+        e = ctx.cache["E_discharge_Wh"]
+        val = float(e / q) if (isinstance(q, (int, float)) and q > 0) else float("nan")
+        return {self.name: val}
 
 
 def compute_single_cycle_kpis(
@@ -453,4 +714,65 @@ def add_capacity_retention(
     retention[~(q > 0)] = np.nan  # no discharge -> no retention
 
     df[out_col] = retention
+    return df
+
+def add_energy_retention(
+    cycle_kpi_df: pd.DataFrame,
+    energy_col: str = "E_discharge_Wh",
+    block_col: str = "block_id",
+    out_col: str = "EnergyRetention_%",
+    cycle_col: str = "cycle_index",
+) -> pd.DataFrame:
+    """
+    Add EnergyRetention_% to a cycle KPI table.
+
+    Definition:
+      EnergyRetention_% = 100 * E_discharge_Wh / E_discharge_Wh_baseline
+
+    Baseline policy:
+      For each block (if present), the baseline is the **first** cycle with
+      positive E_discharge_Wh after sorting by `cycle_index` when available.
+      If no block column exists, a single global baseline is used.
+
+    Required columns:
+      - energy_col (default 'E_discharge_Wh')
+      - Optional: block_col (default 'block_id')
+      - Optional: cycle_col (default 'cycle_index') for ordering the baseline
+
+    Purpose:
+      Tracks retention of delivered energy over cycling, complementing
+      capacity retention for cases where voltage evolution matters.
+    """
+    df = cycle_kpi_df.copy()
+
+    if energy_col not in df.columns:
+        raise KeyError(f"'{energy_col}' not found in cycle KPI table.")
+
+    e = pd.to_numeric(df[energy_col], errors="coerce")
+
+    if block_col in df.columns:
+        order_cols = [block_col]
+        if cycle_col in df.columns:
+            order_cols.append(cycle_col)
+        tmp = df.sort_values(order_cols)
+        first_e0 = (
+            tmp[tmp[energy_col].apply(pd.to_numeric, errors="coerce") > 0]
+            .groupby(block_col, sort=False)[energy_col]
+            .first()
+            .astype(float)
+        )
+        e0 = df[block_col].map(first_e0)
+    else:
+        if cycle_col in df.columns:
+            tmp = df.sort_values(cycle_col)
+        else:
+            tmp = df
+        pos = pd.to_numeric(tmp[energy_col], errors="coerce")
+        pos = pos[pos > 0]
+        e0_scalar = float(pos.iloc[0]) if len(pos) else np.nan
+        e0 = pd.Series(e0_scalar, index=df.index)
+
+    ret = 100.0 * e / e0
+    ret[~(e > 0)] = np.nan  # no discharge energy -> no retention
+    df[out_col] = ret
     return df
