@@ -5,49 +5,34 @@ import numpy as np
 import pandas as pd
 
 """
-KPI CALCULATOR 
-===========================
+KPI CALCULATOR (DOE-driven, RAW-cycle-index ignored)
+===================================================
 
 Purpose
 -------
 Compute per-cycle KPIs (capacity, energy, efficiencies, durations, CC/CV ratios)
 from RAW and DOE tables for battery cycling experiments.
 
-Key Fixes vs. Previous Version
-------------------------------
-1) **CC/CV capacity integration is now "contiguous-run safe"**:
-   We integrate CV and CC **per contiguous run** of (step_type, cc_cv).
-   This prevents bridging over gaps when CV segments are non-contiguous, which
-   previously inflated CV capacity and distorted ratios.
+Critical Policy (per your data model)
+-------------------------------------
+* The authoritative cycle id is **`cycle_number` from DOE`**.
+* RAW ↔ DOE linkage is strictly via the foreign key **`step_number`**.
+* Users provide DOEs already filtered to **one unique `block_id`**. We assert
+  this (if `block_id` exists) and optionally use it to filter RAW defensively.
 
-2) **One-pass normalization and sorting**:
-   We sort by `time_s` once and normalize `step_type`/`cc_cv` once, avoiding
-   repeated `.copy()`, casing, and sorting overhead across helpers.
 
-3) **Clearer documentation and naming**:
-   Docstrings specify units, sign conventions, and assumptions.
 
-Design Notes
-------------
-- Energy and charge magnitudes are computed as **positive** numbers using |I|
-  and |I*V| integrals. This aligns with KPI magnitude comparisons (e.g., CE,
-  energy efficiency).
-- The code trusts `step_type` and `cc_cv` labels provided upstream. Durations
-  are robust (mask-based). Capacities by CC/CV are robust to multi-run cases
-  (contiguous-run grouping) but will, by design, ignore unlabeled rows.
-- We expose both the **CV/CC capacities** and the **mismatch diagnostic** to
-  allow QC against total charge.
-
-Public API 
-----------------------
+Public API
+----------
 - compute_single_cycle_kpis(raw_cycle_df, doe_cycle_df, kpi_units)
-- compute_multi_cycle_kpi_table(raw_df, doe_df, kpi_units, ...)
+- compute_multi_cycle_kpi_table(raw_df, doe_df, kpi_units, cycles=None, ...)
 - add_capacity_retention(...), add_energy_retention(...)
 
-Additional KPI Units
---------------------
-- QChargeAhCV, QChargeAhCC, QChargeAhByCCCV (so CV/CC magnitudes can be added
-  to the KPI table explicitly).
+Notes
+-----
+- Charge/energy are magnitudes (|I|, |I·V|). Signs are not tracked.
+- CC/CV ratios prefer (CV)/(CV+CC); they fall back to (CV)/(total charge)
+  if the split is unavailable.
 """
 
 # =================================================================================
@@ -55,14 +40,9 @@ Additional KPI Units
 # =================================================================================
 
 def _ensure_sorted(df: pd.DataFrame, by: str = "time_s") -> pd.DataFrame:
-    """Return df sorted by `by` (stable sort), no copy if already sorted.
-
-    Assumes `by` exists. If input is small or unsorted, the cost is negligible
-    relative to safety of ensuring monotonic time for integration.
-    """
+    """Return df sorted by `by` (stable sort), no copy if already sorted."""
     if df.empty:
         return df
-    # Fast path: check monotonic. If not monotonic increasing, sort.
     s = df[by]
     if not s.is_monotonic_increasing:
         return df.sort_values(by, kind="mergesort")
@@ -75,13 +55,12 @@ def _integrate_trapz_abs_sorted(df: pd.DataFrame) -> Tuple[float, float, int, in
 
     Preconditions
     -------------
-    - df is already sorted by `time_s` ascending.
-    - Columns present: time_s [s], current_a [A], voltage_v [V].
+    - df is sorted by `time_s`.
+    - Columns: time_s [s], current_a [A], voltage_v [V].
 
     Returns
     -------
     (Q_Ah, E_Wh, n_rows_used, n_pairs_used)
-    where Q_Ah = ∫|I| dt / 3600 and E_Wh = ∫|I·V| dt / 3600.
     """
     needed = {"time_s", "current_a", "voltage_v"}
     if not needed.issubset(df.columns):
@@ -100,22 +79,17 @@ def _integrate_trapz_abs_sorted(df: pd.DataFrame) -> Tuple[float, float, int, in
     if not np.any(mask):
         return 0.0, 0.0, int(len(w)), 0
 
-    # Trapezoid midpoints
     I_mid = 0.5 * (I[:-1] + I[1:])
     IV_mid = 0.5 * (np.abs(I[:-1] * V[:-1]) + np.abs(I[1:] * V[1:]))
 
-    Q_As = np.sum(I_mid[mask] * dt[mask])   # [A·s]
-    E_Ws = np.sum(IV_mid[mask] * dt[mask])  # [W·s]
+    Q_As = np.sum(I_mid[mask] * dt[mask])
+    E_Ws = np.sum(IV_mid[mask] * dt[mask])
 
     return float(Q_As / 3600.0), float(E_Ws / 3600.0), int(len(w)), int(np.sum(mask))
 
 
 def _sum_duration_by_mask_sorted(time_s: pd.Series, mask_sorted: pd.Series) -> float:
-    """Sum duration [s] over rows where `mask_sorted` is True, assuming `time_s`
-    is sorted ascending and `mask_sorted` is index-aligned.
-
-    We count only dt where **both** endpoints satisfy the mask (no bridging).
-    """
+    """Sum duration [s] where both endpoints satisfy the mask (no bridging)."""
     if len(time_s) < 2:
         return 0.0
     t = time_s.to_numpy()
@@ -130,11 +104,7 @@ def _sum_duration_by_mask_sorted(time_s: pd.Series, mask_sorted: pd.Series) -> f
 # =================================================================================
 
 def _sum_over_step_runs_sorted(df_sorted: pd.DataFrame, target_step: str) -> Tuple[float, float, Dict[str, int]]:
-    """Integrate Q/E over **contiguous runs** where `step_type == target_step`.
-
-    Requires df_sorted columns: time_s, current_a, voltage_v, _step_lc, _run_step
-    (created by `_prepare_for_basis`).
-    """
+    """Integrate Q/E over **contiguous runs** where `step_type == target_step`."""
     if df_sorted.empty:
         return 0.0, 0.0, {"runs": 0, "rows": 0, "pairs": 0}
 
@@ -156,12 +126,7 @@ def _sum_over_step_runs_sorted(df_sorted: pd.DataFrame, target_step: str) -> Tup
 
 
 def _sum_measured_step_ah_over_step_runs_sorted(df_sorted: pd.DataFrame, target_step: str) -> Tuple[float, Dict[str, int]]:
-    """Sum device-integrated step charge (Ah) over contiguous runs where
-    `step_type == target_step` using `step_charge_ah`.
-
-    Robust to non-zero start by using |last - first| per run.
-    Returns (Q_meas_Ah, stats). If column missing, returns (NaN, {...}).
-    """
+    """Sum device-integrated step charge (Ah) over runs with `step_type == target_step`."""
     if "step_charge_ah" not in df_sorted.columns:
         return float("nan"), {"runs": 0, "rows": 0}
     if df_sorted.empty:
@@ -187,17 +152,7 @@ def _sum_measured_step_ah_over_step_runs_sorted(df_sorted: pd.DataFrame, target_
 
 
 def _sum_over_charge_cccv_runs_sorted(df_sorted: pd.DataFrame) -> Tuple[float, float, Dict[str, int]]:
-    """Integrate Q (Ah) for charge-time **CV** and **CC** **per contiguous run**.
-
-    Returns
-    -------
-    (Q_CV_Ah, Q_CC_Ah, stats_dict)
-
-    `stats_dict` fields:
-      - runs_cv, runs_cc: number of contiguous runs integrated for CV and CC
-      - rows_cv, rows_cc: total rows used across those runs
-      - pairs_cv, pairs_cc: total positive-dt trapezoid pairs across those runs
-    """
+    """Integrate Q (Ah) for charge-time **CV** and **CC** per contiguous run."""
     if df_sorted.empty:
         return float("nan"), float("nan"), {
             "runs_cv": 0, "rows_cv": 0, "pairs_cv": 0,
@@ -225,13 +180,11 @@ def _sum_over_charge_cccv_runs_sorted(df_sorted: pd.DataFrame) -> Tuple[float, f
             runs_cc += 1
             rows_cc += n_rows
             pairs_cc += n_pairs
-        # else: ignore unlabeled/other
 
     stats = {
         "runs_cv": runs_cv, "rows_cv": rows_cv, "pairs_cv": pairs_cv,
         "runs_cc": runs_cc, "rows_cc": rows_cc, "pairs_cc": pairs_cc,
     }
-    # return NaN if nothing was found at all
     if runs_cv == 0 and runs_cc == 0:
         return float("nan"), float("nan"), stats
     return float(Qcv), float(Qcc), stats
@@ -242,10 +195,8 @@ def _sum_over_charge_cccv_runs_sorted(df_sorted: pd.DataFrame) -> Tuple[float, f
 # =================================================================================
 
 class SingleCycleKPI(Protocol):
-    """A KPI unit that uses the single-cycle context and returns a dict."""
     name: str
     requires_basis: Tuple[str, ...]
-
     def compute(self, ctx: "CycleContext") -> Dict[str, Any]:
         ...
 
@@ -255,65 +206,48 @@ class CycleContext:
     """Holds everything a KPI unit may need for one cycle."""
     raw: pd.DataFrame  # rows for exactly one cycle (charge/OCV/discharge)
     doe: pd.DataFrame  # DOE rows for the same cycle
-    ids: Dict[str, Any] = field(default_factory=dict)    # block_id, cycle_index
+    ids: Dict[str, Any] = field(default_factory=dict)    # block_id, cycle_number
     cache: Dict[str, Any] = field(default_factory=dict)  # basis features & flags
 
     def get_id_tuple(self) -> Tuple[Any, Any]:
-        return self.ids.get("block_id"), self.ids.get("cycle_index")
+        return self.ids.get("block_id"), self.ids.get("cycle_number")
 
 
-# ---- ID extraction ----
+# ---- ID extraction (DOE-only) ----
 
 def _extract_ids(ctx: CycleContext) -> None:
-    """Fill ctx.ids with cycle_index and block_id, preferring DOE; fallback RAW.
-
-    Accepts 'cycle_index' or 'cycle_number' as cycle id. 'block_id' is optional.
-    Picks the first unique value found in the given slice.
+    """Fill ctx.ids using **DOE only** (never RAW):
+    - cycle_number (authoritative)
+    - block_id (optional)
+    Picks the first unique value found in the DOE slice.
     """
-    cyc_col: Optional[str] = None
-    src = None
-    for name in ("cycle_index", "cycle_number"):
-        if name in ctx.doe.columns:
-            cyc_col, src = name, ctx.doe
-            break
-        if name in ctx.raw.columns:
-            cyc_col, src = name, ctx.raw
-            break
-
-    blk_col = None
-    blk_src = None
-    if "block_id" in ctx.doe.columns:
-        blk_col, blk_src = "block_id", ctx.doe
-    elif "block_id" in ctx.raw.columns:
-        blk_col, blk_src = "block_id", ctx.raw
-
     cyc_val = None
-    if cyc_col:
-        u = pd.unique(src[cyc_col].dropna())
+    if "cycle_number" in ctx.doe.columns:
+        u = pd.unique(ctx.doe["cycle_number"].dropna())
         if len(u) >= 1:
             cyc_val = u[0]
 
     blk_val = None
-    if blk_col:
-        u2 = pd.unique(blk_src[blk_col].dropna())
+    if "block_id" in ctx.doe.columns:
+        u2 = pd.unique(ctx.doe["block_id"].dropna())
         if len(u2) >= 1:
             blk_val = u2[0]
 
-    ctx.ids["cycle_index"] = cyc_val
+    ctx.ids["cycle_number"] = cyc_val
     ctx.ids["block_id"] = blk_val
 
 
 # ---- Basis computation ----
 
 def _prepare_for_basis(raw: pd.DataFrame) -> pd.DataFrame:
-    """Return a sorted copy of raw with normalized helper columns:
+    """Return a sorted copy of raw with normalized helper columns.
 
     Added columns
     -------------
     - `_step_lc`: lowercase step_type (str)
-    - `_cccv_uc`: uppercase cc_cv (str; if missing, set to "")
-    - `_run_step`: run id for contiguous step_type blocks
-    - `_run_both`: run id for contiguous (step_type, cc_cv) blocks
+    - `_cccv_uc`: uppercase cc_cv (str; if missing, "")
+    - `_run_step`: contiguous run id for step_type
+    - `_run_both`: contiguous run id for (step_type, cc_cv)
     """
     required = {"time_s", "current_a", "voltage_v", "step_type"}
     missing = required - set(raw.columns)
@@ -321,42 +255,22 @@ def _prepare_for_basis(raw: pd.DataFrame) -> pd.DataFrame:
         raise KeyError(f"raw_cycle_df missing required columns: {missing}")
 
     s = _ensure_sorted(raw, by="time_s").copy()
-
-    step_lc = s["step_type"].astype(str).str.lower()
+    s["_step_lc"] = s["step_type"].astype(str).str.lower()
     if "cc_cv" in s.columns:
-        cccv_uc = s["cc_cv"].astype(str).str.strip().str.upper()
+        s["_cccv_uc"] = s["cc_cv"].astype(str).str.strip().str.upper()
     else:
-        cccv_uc = pd.Series([""] * len(s), index=s.index)
+        s["_cccv_uc"] = ""
 
-    s["_step_lc"] = step_lc
-    s["_cccv_uc"] = cccv_uc
-
-    # Contiguous run ids
     s["_run_step"] = (s["_step_lc"] != s["_step_lc"].shift(1)).cumsum()
     s["_run_both"] = ((s["_step_lc"] != s["_step_lc"].shift(1)) | (s["_cccv_uc"] != s["_cccv_uc"].shift(1))).cumsum()
-
     return s
 
 
 def _compute_basis(ctx: CycleContext) -> None:
-    """Compute once per cycle and cache core basis + CC/CV-aware features.
-
-    Core basis (from raw, magnitudes via trapezoids):
-      - Q_charge_Ah, E_charge_Wh, Q_discharge_Ah, E_discharge_Wh
-      - flags: has_charge, has_discharge, is_partial_cycle
-      - debug_stats: runs/rows/pairs per step_type (+ measured runs/rows)
-      - measured device sums (optional): Q_charge_Ah_meas, Q_discharge_Ah_meas
-
-    CC/CV-aware features (if `cc_cv` exists):
-      - Charge_total_duration_s, Discharge_total_duration_s
-      - Charge_CV_duration_s
-      - Q_charge_Ah_CV, Q_charge_Ah_CC (contiguous-run safe)
-      - Q_charge_Ah_by_cccv = Q_CV + Q_CC (denominator for ratios)
-      - cccv_vs_total_mismatch_% = |(Q_CV+Q_CC) - Q_total| / Q_total * 100
-    """
+    """Compute once per cycle and cache core basis + CC/CV-aware features."""
     s = _prepare_for_basis(ctx.raw)
 
-    # --- Core basis via contiguous step runs ---
+    # Core basis via contiguous step runs
     Qc, Ec, statsC = _sum_over_step_runs_sorted(s, "charge")
     Qd, Ed, statsD = _sum_over_step_runs_sorted(s, "discharge")
 
@@ -372,17 +286,16 @@ def _compute_basis(ctx: CycleContext) -> None:
         "discharge": {**statsD, "meas_runs": statsD_meas["runs"], "meas_rows": statsD_meas["rows"]},
     }
 
-    # --- Durations by step_type ---
+    # Durations by step_type
     charge_total_dur_s = float("nan")
     discharge_total_dur_s = float("nan")
-    if {"time_s", "step_type"}.issubset(s.columns):
-        step_lc = s["_step_lc"]
-        mask_chg = step_lc.eq("charge")
-        mask_dis = step_lc.eq("discharge")
-        charge_total_dur_s = _sum_duration_by_mask_sorted(s["time_s"], mask_chg)
-        discharge_total_dur_s = _sum_duration_by_mask_sorted(s["time_s"], mask_dis)
+    step_lc = s["_step_lc"]
+    mask_chg = step_lc.eq("charge")
+    mask_dis = step_lc.eq("discharge")
+    charge_total_dur_s = _sum_duration_by_mask_sorted(s["time_s"], mask_chg)
+    discharge_total_dur_s = _sum_duration_by_mask_sorted(s["time_s"], mask_dis)
 
-    # --- CC/CV metrics ---
+    # CC/CV metrics
     has_cc_cv_col = "cc_cv" in ctx.raw.columns
     charge_cv_dur_s = float("nan")
     q_charge_cv = float("nan")
@@ -391,15 +304,11 @@ def _compute_basis(ctx: CycleContext) -> None:
     mismatch_pct = float("nan")
 
     if has_cc_cv_col:
-        step_lc = s["_step_lc"]
-        ccv_uc  = s["_cccv_uc"]
-
+        ccv_uc = s["_cccv_uc"]
         mask_charge_cv = step_lc.eq("charge") & ccv_uc.eq("CV")
         charge_cv_dur_s = _sum_duration_by_mask_sorted(s["time_s"], mask_charge_cv)
 
-        # CV/CC capacities per contiguous run (fixes bridging)
         q_charge_cv, q_charge_cc, cc_stats = _sum_over_charge_cccv_runs_sorted(s)
-
         denom = 0.0
         if np.isfinite(q_charge_cv):
             denom += q_charge_cv
@@ -410,7 +319,6 @@ def _compute_basis(ctx: CycleContext) -> None:
         if np.isfinite(Qc) and Qc > 0 and np.isfinite(q_charge_by_cccv):
             mismatch_pct = 100.0 * abs(q_charge_by_cccv - Qc) / Qc
 
-        # Attach CC/CV run stats into debug block for visibility
         debug_stats["charge"].update({
             "cccv_runs_cv": cc_stats.get("runs_cv", 0),
             "cccv_runs_cc": cc_stats.get("runs_cc", 0),
@@ -418,21 +326,17 @@ def _compute_basis(ctx: CycleContext) -> None:
             "cccv_pairs_cc": cc_stats.get("pairs_cc", 0),
         })
 
-    # --- Cache write ---
     ctx.cache.update({
-        # Core basis
         "Q_charge_Ah": Qc,
         "E_charge_Wh": Ec,
         "Q_discharge_Ah": Qd,
         "E_discharge_Wh": Ed,
-        "Q_charge_Ah_meas": Qc_meas,        # may be NaN
-        "Q_discharge_Ah_meas": Qd_meas,     # may be NaN
+        "Q_charge_Ah_meas": Qc_meas,
+        "Q_discharge_Ah_meas": Qd_meas,
         "has_charge": has_charge,
         "has_discharge": has_discharge,
         "is_partial_cycle": is_partial_cycle,
         "debug_stats": debug_stats,
-
-        # Durations and CC/CV-aware features
         "Charge_total_duration_s": charge_total_dur_s,
         "Discharge_total_duration_s": discharge_total_dur_s,
         "Charge_CV_duration_s": charge_cv_dur_s,
@@ -478,7 +382,6 @@ class EDischargeWh:
 
 @dataclass
 class CoulombicEfficiency:
-    """CE (integrated) = Q_discharge_Ah / Q_charge_Ah (NaN if Qc==0 or missing)."""
     name: str = "CoulombicEfficiency"
     requires_basis: Tuple[str, ...] = ("Q_charge_Ah", "Q_discharge_Ah")
     def compute(self, ctx: CycleContext) -> Dict[str, Any]:
@@ -490,7 +393,6 @@ class CoulombicEfficiency:
 
 @dataclass
 class CoulombicEfficiencyMeasured:
-    """CE (measured) = Q_discharge_Ah_meas / Q_charge_Ah_meas (device counters)."""
     name: str = "CoulombicEfficiency_meas"
     requires_basis: Tuple[str, ...] = ("Q_charge_Ah_meas", "Q_discharge_Ah_meas")
     def compute(self, ctx: CycleContext) -> Dict[str, Any]:
@@ -499,8 +401,6 @@ class CoulombicEfficiencyMeasured:
         if np.isfinite(Qc) and np.isfinite(Qd) and Qc > 0:
             return {self.name: float(Qd / Qc)}
         return {self.name: float("nan")}
-
-# --- Duration KPIs ---
 
 @dataclass
 class ChargeCVDurationSeconds:
@@ -516,8 +416,6 @@ class ChargeTotalDurationSeconds:
     def compute(self, ctx: CycleContext) -> Dict[str, Any]:
         return {self.name: float(ctx.cache["Charge_total_duration_s"])}
 
-# --- Ratios (time & capacity) ---
-
 @dataclass
 class ChargeCVTimeRatio:
     name: str = "Charge_CV_time_ratio"
@@ -530,14 +428,6 @@ class ChargeCVTimeRatio:
 
 @dataclass
 class ChargeCVCapacityRatio:
-    """
-    Capacity-based CV fraction in [0..1].
-
-    Definition
-    ----------
-    Default: Q_charge_Ah_CV / (Q_charge_Ah_CV + Q_charge_Ah_CC)
-    Fallback: Q_charge_Ah_CV / Q_charge_Ah (when CV+CC is unavailable)
-    """
     name: str = "Charge_CV_capacity_ratio"
     requires_basis: Tuple[str, ...] = ("Q_charge_Ah_CV", "Q_charge_Ah_by_cccv")
     def compute(self, ctx: CycleContext) -> Dict[str, Any]:
@@ -556,8 +446,6 @@ class CCVTotalMismatchPct:
     requires_basis: Tuple[str, ...] = ("cccv_vs_total_mismatch_%",)
     def compute(self, ctx: CycleContext) -> Dict[str, Any]:
         return {self.name: float(ctx.cache["cccv_vs_total_mismatch_%"])}
-
-# --- Energy efficiency & average voltages ---
 
 @dataclass
 class EnergyEfficiency:
@@ -589,8 +477,6 @@ class VDischargeAvg:
         val = float(e / q) if (isinstance(q, (int, float)) and q > 0) else float("nan")
         return {self.name: val}
 
-# --- NEW: expose CV/CC magnitudes directly as KPIs ---
-
 @dataclass
 class QChargeAhCV:
     name: str = "Q_charge_Ah_CV"
@@ -614,7 +500,7 @@ class QChargeAhByCCCV:
 
 
 # =================================================================================
-# Single-cycle engine
+# Single-cycle engine (IDs from DOE only)
 # =================================================================================
 
 def compute_single_cycle_kpis(
@@ -622,26 +508,18 @@ def compute_single_cycle_kpis(
     doe_cycle_df: pd.DataFrame,
     kpi_units: List[SingleCycleKPI],
 ) -> Dict[str, Any]:
-    """Compute requested KPIs for **one** selected cycle.
+    """Compute requested KPIs for **one** DOE-defined cycle.
 
-    Inputs
-    ------
-    raw_cycle_df : RAW rows for exactly one cycle (contains charge/OCV/discharge)
-    doe_cycle_df : DOE rows for the same cycle (to read cycle/block ids if present)
-    kpi_units    : e.g., [QChargeAh(), QDischargeAh(), ...]
-
-    Output dict includes
-    ---------------------
-    block_id, cycle_index, requested KPIs,
-    flags (has_charge, has_discharge, is_partial_cycle), debug_stats.
+    Output dict includes: block_id (if present), cycle_number, requested KPIs,
+    and flags (has_charge, has_discharge, is_partial_cycle), debug_stats.
     """
     ctx = CycleContext(raw=raw_cycle_df.copy(), doe=doe_cycle_df.copy())
-    _extract_ids(ctx)
+    _extract_ids(ctx)  # DOE-only
     _compute_basis(ctx)
 
     out: Dict[str, Any] = {
         "block_id": ctx.ids.get("block_id"),
-        "cycle_index": ctx.ids.get("cycle_index"),
+        "cycle_number": ctx.ids.get("cycle_number"),
         "has_charge": ctx.cache["has_charge"],
         "has_discharge": ctx.cache["has_discharge"],
         "is_partial_cycle": ctx.cache["is_partial_cycle"],
@@ -660,81 +538,70 @@ def compute_single_cycle_kpis(
 
 
 # =================================================================================
-# Multi-cycle orchestrator
+# Multi-cycle orchestrator (DOE cycle_number only)
 # =================================================================================
 
 def compute_multi_cycle_kpi_table(
     raw_df: pd.DataFrame,
     doe_df: pd.DataFrame,
     kpi_units: List[SingleCycleKPI],
-    cycles: Optional[List[Any]] = None,                 # optional subset of cycle ids
+    cycles: Optional[List[Any]] = None,  # optional subset of DOE cycle_number values
     block_col: str = "block_id",
-    cycle_col_candidates: Tuple[str, ...] = ("cycle_number", "cycle_index"),
     step_col: str = "step_number",
+    cycle_col: str = "cycle_number",
 ) -> pd.DataFrame:
-    """DOE-driven multi-cycle KPI orchestrator.
+    """DOE-driven multi-cycle KPI orchestrator (DOE-only IDs).
 
-    - Enumerates cycles from DOE using the first available cycle column in
-      `cycle_col_candidates`.
-    - For each cycle, collects DOE step numbers and slices RAW by `step_number`
-      (and, if available, same `block_id`).
+    - Enumerates cycles from DOE using **cycle_number**.
+    - For each cycle, collects DOE `step_number`s and slices RAW accordingly.
+    - If `block_id` exists, asserts DOE has a single unique value; RAW is
+      filtered to that block value defensively.
     - Runs the single-cycle KPI engine and aggregates results.
-
-    Assumptions
-    -----------
-    * RAW has `step_number` so we can map DOE→RAW.
-    * If both RAW and DOE have `block_id`, we align them.
     """
-    cyc_col = next((c for c in cycle_col_candidates if c in doe_df.columns), None)
-    if cyc_col is None:
-        raise KeyError(
-            f"No cycle id column found in DOE (looked for {cycle_col_candidates}). "
-            "When cycles are DOE-defined, we must read them from DOE."
-        )
-
+    if cycle_col not in doe_df.columns:
+        raise KeyError(f"DOE must contain '{cycle_col}'.")
     if step_col not in doe_df.columns or step_col not in raw_df.columns:
         raise KeyError(
-            f"'step_number' mapping required. Missing in: "
-            f"{'DOE ' if step_col not in doe_df.columns else ''}"
-            f"{'RAW' if step_col not in raw_df.columns else ''}"
-        )
+            f"'{step_col}' mapping required in both DOE and RAW tables.")
 
-    # Determine which cycles to process
-    all_cycles = pd.unique(doe_df[cyc_col].dropna())
+    # Assert single block (if provided)
+    blk_val = None
+    if block_col in doe_df.columns:
+        ublk = pd.unique(doe_df[block_col].dropna())
+        if len(ublk) > 1:
+            raise ValueError(
+                f"DOE contains multiple block_id values {ublk}. Please provide a DOE subset with a single block."
+            )
+        blk_val = ublk[0] if len(ublk) == 1 else None
+
+    # Determine cycles to process
+    all_cycles = pd.unique(doe_df[cycle_col].dropna())
     if cycles is not None:
         wanted = set(cycles)
         all_cycles = [c for c in all_cycles if c in wanted]
 
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for c in all_cycles:
-        doe_cycle = doe_df[doe_df[cyc_col] == c]
-
+        doe_cycle = doe_df[doe_df[cycle_col] == c]
         step_ids = pd.unique(doe_cycle[step_col].dropna())
         if len(step_ids) == 0:
             continue
 
         raw_slice = raw_df[raw_df[step_col].isin(step_ids)].copy()
-
-        if block_col in doe_cycle.columns and block_col in raw_slice.columns:
-            blk_val = doe_cycle[block_col].iloc[0]
+        if blk_val is not None and block_col in raw_slice.columns:
             raw_slice = raw_slice[raw_slice[block_col] == blk_val]
 
         res = compute_single_cycle_kpis(raw_slice, doe_cycle, kpi_units)
-
-        if "cycle_index" not in res or pd.isna(res["cycle_index"]):
-            res["cycle_index"] = c
-        if cyc_col == "cycle_number":
-            res["cycle_number"] = c
-        if ("block_id" not in res or pd.isna(res["block_id"])) and (block_col in doe_cycle.columns):
-            res["block_id"] = doe_cycle[block_col].iloc[0]
-
+        res[cycle_col] = c  # always include DOE cycle_number
+        if blk_val is not None:
+            res[block_col] = blk_val
         rows.append(res)
 
     return pd.DataFrame(rows)
 
 
 # =================================================================================
-# Meta-KPIs: retention utilities
+# Meta-KPIs: retention utilities (default to DOE cycle_number)
 # =================================================================================
 
 def add_capacity_retention(
@@ -742,10 +609,12 @@ def add_capacity_retention(
     discharge_col: str = "Q_discharge_Ah",
     block_col: str = "block_id",
     out_col: str = "CapacityRetention_%",
-    cycle_col: str = "cycle_index",
+    cycle_col: str = "cycle_number",
 ) -> pd.DataFrame:
-    """Add CapacityRetention_% = 100 * Q_discharge_Ah / (first positive Q_discharge_Ah),
-    computed per block if `block_col` exists, else globally.
+    """Add CapacityRetention_% = 100 * Q_discharge_Ah / first positive baseline.
+
+    Baseline is computed per block if `block_id` present, else globally.
+    Ordering (for the "first" baseline) uses DOE `cycle_number` by default.
     """
     df = cycle_kpi_df.copy()
     if discharge_col not in df.columns:
@@ -782,12 +651,11 @@ def add_energy_retention(
     energy_col: str = "E_discharge_Wh",
     block_col: str = "block_id",
     out_col: str = "EnergyRetention_%",
-    cycle_col: str = "cycle_index",
+    cycle_col: str = "cycle_number",
 ) -> pd.DataFrame:
-    """Add EnergyRetention_% = 100 * E_discharge_Wh / baseline E_discharge_Wh.
+    """Add EnergyRetention_% = 100 * E_discharge_Wh / first positive baseline.
 
-    Baseline is the first cycle with positive E_discharge_Wh per block (if
-    present) or globally otherwise.
+    Baseline selection policy matches `add_capacity_retention`.
     """
     df = cycle_kpi_df.copy()
     if energy_col not in df.columns:
