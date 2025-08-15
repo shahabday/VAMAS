@@ -1,4 +1,5 @@
 local_config.yaml
+*.yaml
 *.pyc
 *.pyo
 *.pyd
