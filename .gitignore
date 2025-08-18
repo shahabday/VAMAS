@@ -4,3 +4,4 @@ local_config.yaml
 *.pyo
 *.pyd
 __pycache__/
+artifacts
